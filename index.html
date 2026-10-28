@@ -3566,5 +3566,210 @@
   };
 })();
 </script>
+<!-- =====================================================================
+     CAMERA SCANNER FIX ADD-ON — মূল HTML-এর </body> ট্যাগের ঠিক আগে পেস্ট করুন
+     (সবচেয়ে শেষের add-on হিসেবে, অন্য add-on গুলোর নিচে বসান)
+     ===================================================================== -->
+<style>
+  /* ক্যামেরার ফ্রেম: চৌকোণা কাটা নয়, স্বাভাবিক 4:3 */
+  #camera-frame { aspect-ratio: 4 / 3 !important; max-height: none !important; }
+  /* পুরনো ডেমো দাগ লুকানো, লাইব্রেরির নিজের স্ক্যান বক্সই থাকবে */
+  #camera-frame > .pointer-events-none { display: none !important; }
+</style>
+
+<script>
+(function () {
+  const $ = id => document.getElementById(id);
+  const modal = $('camera-scanner-modal');
+  const viewport = $('camera-reader-viewport');
+  const frame = viewport.parentElement;
+  frame.id = 'camera-frame';
+
+  let scanner = null;
+  let state = 'idle';        // idle | starting | running | stopping
+  let token = 0;
+  let lastCode = '', lastTime = 0, torchOn = false;
+
+  /* ---------- অতিরিক্ত বাটন: ফ্ল্যাশ ও ছবি থেকে স্ক্যান ---------- */
+  const bar = document.createElement('div');
+  bar.className = 'flex flex-wrap items-center gap-2 mb-2';
+  bar.innerHTML =
+    '<button id="cam-torch" type="button" class="hidden px-3 py-1.5 bg-amber-100 hover:bg-amber-200 text-amber-900 font-semibold rounded-lg text-[11px]">🔦 ফ্ল্যাশ চালু</button>' +
+    '<label class="px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold rounded-lg text-[11px] cursor-pointer">🖼️ ছবি তুলে স্ক্যান' +
+    '<input id="cam-file" type="file" accept="image/*" capture="environment" class="hidden"></label>' +
+    '<span id="cam-status" class="text-[11px] text-slate-500 w-full"></span>';
+  frame.after(bar);
+
+  const setStatus = (msg, isErr) => {
+    const el = $('cam-status');
+    el.textContent = msg || '';
+    el.className = 'text-[11px] w-full ' + (isErr ? 'text-rose-600 font-semibold' : 'text-slate-500');
+  };
+
+  /* ---------- লাইব্রেরি ও স্ক্যানার ---------- */
+  function loadLib() {
+    if (window.Html5Qrcode) return Promise.resolve();
+    return new Promise((res, rej) => {
+      const s = document.createElement('script');
+      s.src = 'https://cdn.jsdelivr.net/npm/html5-qrcode@2.3.8/html5-qrcode.min.js';
+      s.onload = res;
+      s.onerror = () => rej({ name: 'lib' });
+      document.head.appendChild(s);
+    });
+  }
+
+  function makeScanner() {
+    const F = Html5QrcodeSupportedFormats;
+    return new Html5Qrcode('camera-reader-viewport', {
+      formatsToSupport: [F.CODE_128, F.CODE_39, F.EAN_13, F.EAN_8, F.UPC_A, F.UPC_E, F.ITF, F.QR_CODE],
+      experimentalFeatures: { useBarCodeDetectorIfSupported: true },
+      verbose: false
+    });
+  }
+
+  async function safeStop(sc) {
+    sc = sc || scanner;
+    try {
+      if (sc) {
+        if (sc.isScanning) await sc.stop();
+        sc.clear();
+      }
+    } catch (e) {}
+    if (scanner === sc) scanner = null;
+    torchOn = false;
+  }
+
+  function showErr(e) {
+    const raw = ((e && (e.name ? e.name + ' ' + (e.message || '') : e.message)) || String(e || '')) + '';
+    let m;
+    if (/NotAllowed|Permission|denied/i.test(raw)) m = 'ক্যামেরার অনুমতি দেওয়া হয়নি — ঠিকানা বারের 🔒 চেপে Camera → Allow করুন';
+    else if (/NotFound|no camera|device not found/i.test(raw)) m = 'কোনো ক্যামেরা পাওয়া যায়নি';
+    else if (/NotReadable|TrackStart|in use/i.test(raw)) m = 'ক্যামেরা অন্য অ্যাপে চালু আছে, সেটা বন্ধ করে আবার চেষ্টা করুন';
+    else if (/Insecure/.test(raw)) m = 'ক্যামেরার জন্য সাইট HTTPS (বা localhost) এ খুলতে হবে';
+    else if (/^lib/.test(raw)) m = 'স্ক্যানার লাইব্রেরি লোড হয়নি, ইন্টারনেট চেক করুন';
+    else m = 'ক্যামেরা চালু করা যায়নি: ' + raw.trim();
+    setStatus('⚠️ ' + m + ' (চাইলে "ছবি তুলে স্ক্যান" ব্যবহার করুন)', true);
+    showToast(m, 'error');
+  }
+
+  /* ---------- স্ক্যান পাওয়া গেলে ---------- */
+  function onDecode(text) {
+    if (state !== 'running') return;                       // একই স্ক্যানে বারবার কার্টে যোগ হওয়া বন্ধ
+    const now = Date.now();
+    if (text === lastCode && now - lastTime < 1500) return;
+    lastCode = text; lastTime = now;
+    closeCam();                                            // আগে ক্যামেরা বন্ধ
+    processScannedBarcode(text);
+  }
+
+  /* ---------- খোলা ---------- */
+  async function openCam() {
+    if (state !== 'idle') return;
+    const my = ++token;
+    state = 'starting';
+    modal.classList.remove('hidden');
+    modal.classList.add('flex');
+    lucide.createIcons();
+    $('cam-torch').classList.add('hidden');
+    setStatus('ক্যামেরা চালু হচ্ছে...');
+
+    let sc = null;
+    try {
+      await loadLib();
+      if (my !== token) return;
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw { name: 'Insecure' };
+
+      sc = makeScanner();
+      scanner = sc;
+      const cfg = {
+        fps: 10,
+        qrbox: (w, h) => ({ width: Math.floor(Math.min(w * 0.85, 340)), height: Math.floor(Math.min(h * 0.5, 170)) })
+      };
+      try {
+        await sc.start({ facingMode: 'environment' }, cfg, onDecode, () => {});
+      } catch (e1) {
+        if (my !== token) throw e1;
+        const cams = await Html5Qrcode.getCameras();     // ল্যাপটপ/ওয়েবক্যামের জন্য বিকল্প
+        if (!cams || !cams.length) throw e1;
+        await sc.start(cams[cams.length - 1].id, cfg, onDecode, () => {});
+      }
+
+      if (my !== token) { await safeStop(sc); return; }  // চালু হতে হতে মডাল বন্ধ হয়ে গেলে
+      state = 'running';
+      setStatus('বারকোডটি ফ্রেমের ভেতরে ধরুন');
+      initTorch();
+    } catch (e) {
+      await safeStop(sc);
+      if (my !== token) return;
+      state = 'idle';
+      showErr(e);
+    }
+  }
+
+  /* ---------- বন্ধ করা ---------- */
+  async function closeCam() {
+    token++;
+    state = 'stopping';
+    modal.classList.add('hidden');
+    modal.classList.remove('flex');
+    await safeStop();
+    state = 'idle';
+  }
+
+  /* ---------- ফ্ল্যাশ ---------- */
+  function initTorch() {
+    const btn = $('cam-torch');
+    btn.classList.add('hidden');
+    btn.textContent = '🔦 ফ্ল্যাশ চালু';
+    try {
+      const caps = scanner.getRunningTrackCameraCapabilities();
+      const t = caps.torchFeature();
+      if (t.isSupported()) {
+        btn.classList.remove('hidden');
+        btn.onclick = async () => {
+          try {
+            await t.apply(!torchOn);
+            torchOn = !torchOn;
+            btn.textContent = torchOn ? '🔦 ফ্ল্যাশ বন্ধ' : '🔦 ফ্ল্যাশ চালু';
+          } catch (e) {}
+        };
+      }
+    } catch (e) {}
+  }
+
+  /* ---------- ছবি তুলে/বেছে স্ক্যান (লাইভ ক্যামেরা না চললে বিকল্প) ---------- */
+  $('cam-file').addEventListener('change', async e => {
+    const file = e.target.files[0];
+    e.target.value = '';
+    if (!file) return;
+    setStatus('ছবি পড়া হচ্ছে...');
+    try {
+      await loadLib();
+      token++;
+      await safeStop();
+      state = 'idle';
+      const tmp = makeScanner();
+      const text = await tmp.scanFile(file, false);
+      try { tmp.clear(); } catch (x) {}
+      await closeCam();
+      processScannedBarcode(text);
+    } catch (err) {
+      setStatus('⚠️ ছবিতে বারকোড পাওয়া যায়নি। বারকোড কাছ থেকে, স্পষ্ট ও আলোতে তুলে আবার চেষ্টা করুন।', true);
+    }
+  });
+
+  /* ---------- অন্যান্য ---------- */
+  modal.addEventListener('click', ev => { if (ev.target === modal) closeCam(); });
+  window.addEventListener('keydown', ev => {
+    if (ev.key === 'Escape' && !modal.classList.contains('hidden')) closeCam();
+  });
+
+  // পুরনো ফাংশনগুলো বদলে নতুনগুলো বসানো (HTML-এর onclick এগুলোই ডাকে)
+  window.openCameraScannerModal = openCam;
+  window.closeCameraScannerModal = closeCam;
+  window.startCameraScanner = openCam;
+  window.stopCameraScanner = () => safeStop();
+})();
+</script>
 </body>
 </html>

@@ -3205,5 +3205,194 @@
       }, 2500);
     }
   </script>
+  <!-- =====================================================================
+     FIREBASE (Firestore) ADD-ON — আপনার মূল HTML ফাইলের </body> ট্যাগের ঠিক আগে পেস্ট করুন।
+     মূল কোডের কিছুই মুছতে হবে না। LocalStorage ক্যাশ হিসেবে থাকবে, ডাটাবেস হবে Firestore।
+     ===================================================================== -->
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-app.js";
+  import { getAnalytics, isSupported } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-analytics.js";
+  import { initializeFirestore, persistentLocalCache, persistentMultipleTabManager, collection, doc, onSnapshot, setDoc, writeBatch }
+    from "https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js";
+
+  const firebaseConfig = {
+    apiKey: "AIzaSyB377aY9sBt__ghtnYow6r2PweIwl7q-XE",
+    authDomain: "cloth-store-pos.firebaseapp.com",
+    projectId: "cloth-store-pos",
+    storageBucket: "cloth-store-pos.firebasestorage.app",
+    messagingSenderId: "421224640457",
+    appId: "1:421224640457:web:f001d840a5abd5d14fc218",
+    measurementId: "G-H45MD17V5S"
+  };
+
+  const app = initializeApp(firebaseConfig);
+  isSupported().then(ok => ok && getAnalytics(app)).catch(() => {});
+
+  // অফলাইনেও কাজ করবে (ইন্টারনেট এলে নিজে সিঙ্ক হবে)
+  let db;
+  try {
+    db = initializeFirestore(app, {
+      localCache: persistentLocalCache({ tabManager: persistentMultipleTabManager() }),
+      ignoreUndefinedProperties: true
+    });
+  } catch (e) {
+    db = initializeFirestore(app, { ignoreUndefinedProperties: true });
+  }
+
+  /* ---------- হেডারে ক্লাউড স্ট্যাটাস ব্যাজ ---------- */
+  const pill = document.createElement('div');
+  pill.className = 'flex items-center gap-1.5 px-2.5 py-1.5 bg-slate-100 border border-slate-200 text-slate-700 rounded-xl text-xs font-semibold no-print';
+  pill.innerHTML = '<span id="cloud-dot" class="w-2 h-2 rounded-full bg-slate-400"></span><span id="cloud-label" class="hidden sm:inline"></span>';
+  document.getElementById('hw-scanner-pill').before(pill);
+
+  const ST = {
+    connecting: ['bg-slate-400', 'ক্লাউডে সংযোগ হচ্ছে...'],
+    synced:     ['bg-emerald-500', 'ক্লাউডে সেভ আছে'],
+    syncing:    ['bg-amber-500 animate-pulse', 'সিঙ্ক হচ্ছে...'],
+    offline:    ['bg-amber-500', 'অফলাইন (নেট এলে সিঙ্ক হবে)'],
+    error:      ['bg-rose-500', 'ক্লাউড ত্রুটি']
+  };
+  function setStatus(s) {
+    document.getElementById('cloud-dot').className = 'w-2 h-2 rounded-full ' + ST[s][0];
+    document.getElementById('cloud-label').textContent = ST[s][1];
+  }
+  setStatus('connecting');
+  window.addEventListener('offline', () => setStatus('offline'));
+  window.addEventListener('online', () => setStatus('synced'));
+
+  const toast = (m, t) => window.showToast && window.showToast(m, t);
+  const fail = e => {
+    console.error('Firebase:', e);
+    setStatus('error');
+    toast(e && e.code === 'permission-denied'
+      ? 'Firestore Rules এ অনুমতি নেই — Firebase Console থেকে Rules ঠিক করুন'
+      : 'ক্লাউড সিঙ্ক ব্যর্থ: ' + ((e && (e.code || e.message)) || ''), 'error');
+  };
+
+  /* ---------- লোকাল → Firestore সিঙ্ক (শুধু পরিবর্তিত ডকুমেন্ট লেখে) ---------- */
+  const synced = { products: new Map(), sales: new Map() };
+
+  async function syncList(name, list, allowDelete) {
+    const cur = new Map(list.map(x => [x.id, JSON.stringify(x)]));
+    const prev = synced[name], ops = [];
+    cur.forEach((j, id) => { if (prev.get(id) !== j) ops.push([id, JSON.parse(j)]); });
+    if (allowDelete) prev.forEach((_, id) => { if (!cur.has(id)) ops.push([id, null]); });
+    if (!ops.length) return;
+    synced[name] = allowDelete ? cur : new Map([...prev, ...cur]);
+    setStatus('syncing');
+    try {
+      for (let i = 0; i < ops.length; i += 400) {
+        const b = writeBatch(db);
+        ops.slice(i, i + 400).forEach(([id, data]) =>
+          data ? b.set(doc(db, name, id), data) : b.delete(doc(db, name, id)));
+        await b.commit();
+      }
+      setStatus(navigator.onLine ? 'synced' : 'offline');
+    } catch (e) { synced[name] = prev; fail(e); }
+  }
+
+  const saveSetting = (k, v) =>
+    setDoc(doc(db, 'settings', k), JSON.parse(JSON.stringify(v))).catch(fail);
+
+  /* ---------- Firestore → স্ক্রিন (রিয়েলটাইম, সব ডিভাইসে একই ডাটা) ---------- */
+  const seeded = {};
+
+  function listen(name, apply, localList) {
+    onSnapshot(collection(db, name), snap => {
+      if (snap.empty) {
+        if (!snap.metadata.fromCache) {
+          if (!seeded[name]) {            // ক্লাউড ফাঁকা: প্রথমবার পুরনো লোকাল ডাটা আপলোড
+            seeded[name] = true;
+            const l = localList();
+            if (l.length) syncList(name, l, name === 'products');
+          } else { synced[name] = new Map(); apply([]); }
+        }
+        return;
+      }
+      seeded[name] = true;
+      const list = snap.docs.map(d => ({ ...d.data(), id: d.id }));
+      synced[name] = new Map(list.map(x => [x.id, JSON.stringify(x)]));
+      apply(list);
+      setStatus(!navigator.onLine ? 'offline' : snap.metadata.hasPendingWrites ? 'syncing' : 'synced');
+    }, fail);
+  }
+
+  const normalize = l => l.map(p => (p.variants && p.variants.length) ? p : {
+    ...p,
+    variants: [{ size: p.size || 'Free Size', sku: p.sku || ('1' + Math.floor(1e9 + Math.random() * 9e9)), stock: Number(p.stock) || 0 }]
+  });
+
+  listen('products', list => {
+    products = normalize(list);
+    localStorage.setItem(STORAGE_KEY_PROD, JSON.stringify(products));
+    renderPosCatalog(); renderInventory(); updateDashboard();
+  }, () => products);
+
+  // ডেমো মেমো দুটি (MEMO-842101/02) আসল রিপোর্টে মিশে যাওয়া আটকাতে বাদ দেওয়া হলো
+  const DEMO = ['MEMO-842101', 'MEMO-842102'];
+  listen('sales', list => {
+    sales = list.sort((a, b) => new Date(b.date) - new Date(a.date));
+    localStorage.setItem(STORAGE_KEY_SALES, JSON.stringify(sales));
+    renderSalesReportView(); updateDashboard();
+  }, () => {
+    const clean = sales.filter(s => !DEMO.includes(s.id));
+    if (clean.length !== sales.length) {
+      sales = clean;
+      localStorage.setItem(STORAGE_KEY_SALES, JSON.stringify(sales));
+      renderSalesReportView(); updateDashboard();
+    }
+    return clean;
+  });
+
+  function listenSetting(key, getLocal, apply) {
+    onSnapshot(doc(db, 'settings', key), s => {
+      if (s.exists()) { seeded['s_' + key] = true; apply(s.data()); }
+      else if (!s.metadata.fromCache && !seeded['s_' + key]) { seeded['s_' + key] = true; saveSetting(key, getLocal()); }
+    }, fail);
+  }
+  listenSetting('shop', () => shopConfig, d => {
+    shopConfig = { ...DEFAULT_CONFIG, ...d };
+    localStorage.setItem(STORAGE_KEY_CONFIG, JSON.stringify(shopConfig));
+    activePrinterFormat = shopConfig.defaultPrinter || '80mm';
+    applyShopConfigUI(); applyPrinterStyleRule(activePrinterFormat);
+  });
+  listenSetting('tag', () => tagConfig, d => {
+    tagConfig = { ...DEFAULT_TAG_CONFIG, ...d };
+    localStorage.setItem(STORAGE_KEY_TAG_CONFIG, JSON.stringify(tagConfig));
+    if (document.getElementById('view-tags').classList.contains('hidden')) initTagMaker();
+  });
+
+  /* ---------- মূল ফাংশনগুলোতে হুক: সেভ করলেই ক্লাউডেও যাবে ---------- */
+  const hook = (fn, after) => {
+    const orig = window[fn];
+    window[fn] = function (...a) {
+      const r = orig.apply(this, a);
+      try { after(...a); } catch (e) { fail(e); }
+      return r;
+    };
+  };
+  hook('saveProducts', () => syncList('products', products, true));
+  hook('saveSales', () => syncList('sales', sales, false));
+  hook('saveShopSettings', () => saveSetting('shop', shopConfig));
+  hook('setPrinterFormat', (f, persist) => { if (persist) saveSetting('shop', shopConfig); });
+  hook('saveTagSettingsAsDefault', () => saveSetting('tag', tagConfig));
+
+  /* ---------- বাগ ফিক্স ---------- */
+  // ১) বারকোড বক্সে Enter চাপলে একই পণ্য দুইবার কার্টে যেত
+  document.getElementById('pos-barcode-input').addEventListener('keydown', e => {
+    if (e.key === 'Enter') e.stopPropagation();
+  });
+
+  // ২) কার্টে পণ্য বাড়ালে/কমালে "পরিশোধ" পুরনো অঙ্কেই আটকে থাকত
+  const paid = document.getElementById('pos-paid-amount');
+  let paidTouched = false;
+  paid.addEventListener('input', () => { paidTouched = true; });
+  const origTotals = window.updateCartTotals;
+  window.updateCartTotals = function () {
+    if (!cart.length) paidTouched = false;
+    if (!paidTouched) paid.value = '';
+    return origTotals.apply(this, arguments);
+  };
+</script>
 </body>
 </html>
